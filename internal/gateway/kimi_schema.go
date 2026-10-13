@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"encoding/json"
 	"strconv"
 	"strings"
 
@@ -46,6 +47,79 @@ func kimiToolEnumTypes(p provider.Provider, to provider.Protocol, body []byte) [
 	}
 	out.Write(body[last:])
 	return out.Bytes()
+}
+
+// kimiDropDeferredTools is body without Claude Code ToolSearch's
+// deferred-tool blocks — tool_addition, tool_removal and tool_reference —
+// in its messages: Kimi's Anthropic endpoint refuses the whole request
+// for them, 400 "Invalid request Error" (#2042). A tool_addition only
+// says a tool is there, which the request's own tools list already says,
+// so leaving them out changes nothing but the refusal; a message left
+// with nothing in it goes with them. A tool_reference inside a
+// tool_result, how a loaded tool is named, is no message block and stays.
+// A body with none of them is sent as it was.
+func kimiDropDeferredTools(p provider.Provider, to provider.Protocol, body []byte) []byte {
+	if !isKimi(p, to) {
+		return body
+	}
+	if !bytes.Contains(body, []byte(`"tool_addition"`)) && !bytes.Contains(body, []byte(`"tool_removal"`)) && !bytes.Contains(body, []byte(`"tool_reference"`)) {
+		return body
+	}
+	var v struct {
+		Messages []json.RawMessage `json:"messages"`
+	}
+	if json.Unmarshal(body, &v) != nil {
+		return body
+	}
+	out := make([]json.RawMessage, 0, len(v.Messages))
+	changed := false
+	for _, raw := range v.Messages {
+		c := gjson.GetBytes(raw, "content")
+		if !c.IsArray() {
+			out = append(out, raw)
+			continue
+		}
+		var blocks []json.RawMessage
+		if json.Unmarshal([]byte(c.Raw), &blocks) != nil {
+			out = append(out, raw)
+			continue
+		}
+		kept := make([]json.RawMessage, 0, len(blocks))
+		for _, b := range blocks {
+			switch gjson.GetBytes(b, "type").String() {
+			case "tool_addition", "tool_removal", "tool_reference":
+				changed = true
+			default:
+				kept = append(kept, b)
+			}
+		}
+		if len(kept) == len(blocks) {
+			out = append(out, raw)
+			continue
+		}
+		if len(kept) == 0 {
+			continue
+		}
+		var m map[string]json.RawMessage
+		if json.Unmarshal(raw, &m) != nil {
+			out = append(out, raw)
+			continue
+		}
+		content, err := marshalPlain(kept)
+		if err != nil {
+			return body
+		}
+		m["content"] = content
+		b, err := marshalPlain(m)
+		if err != nil {
+			return body
+		}
+		out = append(out, b)
+	}
+	if !changed {
+		return body
+	}
+	return withFields(body, map[string]any{"messages": out})
 }
 
 // isKimi is whether p is served by Moonshot: the Kimi platform's API or a

@@ -3310,6 +3310,9 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 	var betas []string
 	if to == provider.Anthropic {
 		body = s.bodyBetas(p, body)
+		// Claude Code's deferred-tool blocks, which Kimi's Anthropic
+		// endpoint refuses with a whole-request 400 (#2042)
+		body = kimiDropDeferredTools(p, to, body)
 		// what every path to an Anthropic endpoint sends, relayed or
 		// built, with the model named as the vendor names it; before the
 		// shapes a provider refused are taken out, as it asks a display

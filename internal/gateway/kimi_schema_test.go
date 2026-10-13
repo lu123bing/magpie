@@ -228,3 +228,139 @@ func TestKimiLockedSampling(t *testing.T) {
 		}
 	})
 }
+
+// Claude Code's ToolSearch keeps deferred tools as blocks in the
+// conversation — a {role:"system"} message whose content is
+// [{"type":"text",…},{"tool":"Read","type":"tool_addition"}] — and Kimi's
+// Anthropic endpoint refuses the whole request for them, 400 "Invalid
+// request Error" (#2042). Once such a block is in the history every later
+// request fails, while the Chat path is fine (its Request/Part model has
+// no such concept, so parsing drops the block). What Kimi is sent leaves
+// the blocks out — tool_addition, tool_removal and tool_reference — and a
+// message left with nothing in it; the request's own tools list already
+// says the tool is there. Anyone else is sent the blocks as they came,
+// and a tool_reference inside a tool_result, how a loaded tool is named,
+// stays.
+func TestKimiDropsDeferredToolBlocks(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	kimi, err := provider.FromPreset("kimi-code-cn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kimi.ID, kimi.Key, kimi.Models = "kimi", "k", []string{"k3-256k"}
+	other := provider.Provider{ID: "other", Name: "Other", Key: "k", Anthropic: "https://other.test/v1", Models: []string{"m"}}
+	for _, p := range []provider.Provider{kimi, other} {
+		if err := provider.Save(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var sent []string
+	s := New()
+	s.client = &http.Client{Transport: countTransport(func(r *http.Request) (*http.Response, error) {
+		b, _ := io.ReadAll(r.Body)
+		sent = append(sent, string(b))
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": {"application/json"}},
+			Body: io.NopCloser(strings.NewReader(`{"id":"msg_1","type":"message","role":"assistant","model":"m","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))}, nil
+	})}
+	post := func(t *testing.T, body string) string {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(body)))
+		if rec.Code != 200 {
+			t.Fatalf("%d %s", rec.Code, rec.Body)
+		}
+		return sent[len(sent)-1]
+	}
+	messagesOf := func(t *testing.T, body string) []any {
+		t.Helper()
+		var v struct {
+			Messages []any `json:"messages"`
+		}
+		if err := json.Unmarshal([]byte(body), &v); err != nil {
+			t.Fatalf("Kimi was sent invalid JSON: %s", body)
+		}
+		return v.Messages
+	}
+	// the issue's bytes: a system message carrying text and a deferred tool
+	t.Run("a tool_addition beside text leaves the text", func(t *testing.T) {
+		got := post(t, `{"model":"kimi/k3-256k","messages":[{"role":"user","content":"hi"},`+
+			`{"role":"system","content":[{"type":"text","text":"t"},{"tool":"Read","type":"tool_addition"}]},`+
+			`{"role":"user","content":"ok?"}],"thinking":{"type":"disabled"},"max_tokens":32}`)
+		if strings.Contains(got, "tool_addition") {
+			t.Errorf("Kimi was sent the deferred tool block: %s", got)
+		}
+		msgs := messagesOf(t, got)
+		if len(msgs) != 3 {
+			t.Fatalf("Kimi was sent %d messages: %s", len(msgs), got)
+		}
+		sys, _ := json.Marshal(msgs[1])
+		if gjson.GetBytes(sys, "content.0.text").String() != "t" || gjson.GetBytes(sys, "content.1").Exists() {
+			t.Errorf("the system message's text was not kept as it was: %s", got)
+		}
+	})
+	t.Run("a message left with nothing in it goes with the blocks", func(t *testing.T) {
+		got := post(t, `{"model":"kimi/k3-256k","messages":[{"role":"user","content":"hi"},`+
+			`{"role":"system","content":[{"tool":"Read","type":"tool_addition"}]},`+
+			`{"role":"user","content":"ok?"}],"max_tokens":32}`)
+		msgs := messagesOf(t, got)
+		if len(msgs) != 2 {
+			t.Fatalf("Kimi was sent %d messages: %s", len(msgs), got)
+		}
+		for _, m := range msgs {
+			b, _ := json.Marshal(m)
+			if gjson.GetBytes(b, "role").String() == "system" {
+				t.Errorf("the emptied system message was kept: %s", got)
+			}
+		}
+	})
+	t.Run("tool_removal and tool_reference go too", func(t *testing.T) {
+		got := post(t, `{"model":"kimi/k3-256k","messages":[{"role":"user","content":[`+
+			`{"type":"text","text":"hi"},{"tool":"Read","type":"tool_removal"},`+
+			`{"type":"tool_reference","tool_name":"Read"}]}]`+`,"max_tokens":32}`)
+		if strings.Contains(got, "tool_removal") || strings.Contains(got, "tool_reference") {
+			t.Errorf("Kimi was sent the deferred tool blocks: %s", got)
+		}
+		msgs := messagesOf(t, got)
+		if len(msgs) != 1 {
+			t.Fatalf("Kimi was sent %d messages: %s", len(msgs), got)
+		}
+		b, _ := json.Marshal(msgs[0])
+		if gjson.GetBytes(b, "content.0.text").String() != "hi" || gjson.GetBytes(b, "content.1").Exists() {
+			t.Errorf("the text beside the blocks was not kept as it was: %s", got)
+		}
+	})
+	t.Run("a user message's block goes the same way", func(t *testing.T) {
+		got := post(t, `{"model":"kimi/k3-256k","messages":[{"role":"user","content":[`+
+			`{"type":"text","text":"hi"},{"tool":"Read","type":"tool_addition"}]}]`+`,"max_tokens":32}`)
+		if strings.Contains(got, "tool_addition") {
+			t.Errorf("Kimi was sent the deferred tool block: %s", got)
+		}
+	})
+	t.Run("a tool_reference inside a tool_result stays", func(t *testing.T) {
+		got := post(t, `{"model":"kimi/k3-256k","messages":[{"role":"user","content":[`+
+			`{"type":"tool_result","tool_use_id":"t1","content":[{"type":"tool_reference","tool_name":"WebSearch"}]}]}],"max_tokens":32}`)
+		if !strings.Contains(got, `"tool_reference"`) {
+			t.Errorf("the tool_result's tool_reference was dropped: %s", got)
+		}
+	})
+	t.Run("another provider is sent the blocks as they came", func(t *testing.T) {
+		body := `{"model":"other/m","messages":[{"role":"system","content":[{"type":"text","text":"t"},{"tool":"Read","type":"tool_addition"}]}],"max_tokens":32}`
+		got := post(t, body)
+		if !strings.Contains(got, `"tool_addition"`) {
+			t.Errorf("another provider was not sent the blocks: %s", got)
+		}
+	})
+	t.Run("a text-only system message is sent as it was", func(t *testing.T) {
+		got := post(t, `{"model":"kimi/k3-256k","messages":[{"role":"user","content":"hi"},`+
+			`{"role":"system","content":[{"type":"text","text":"t"}]},{"role":"user","content":"ok?"}],"max_tokens":32}`)
+		msgs := messagesOf(t, got)
+		if len(msgs) != 3 {
+			t.Fatalf("Kimi was sent %d messages: %s", len(msgs), got)
+		}
+		b, _ := json.Marshal(msgs[1])
+		if gjson.GetBytes(b, "content.0.text").String() != "t" {
+			t.Errorf("the text-only system message changed: %s", got)
+		}
+	})
+}
